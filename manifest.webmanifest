@@ -1,0 +1,12 @@
+{
+  "name": "Kayit · cahier de ndawtal",
+  "short_name": "Kayit",
+  "description": "Le cahier de ndawtal qui ne se perd pas.",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#fbf7ef",
+  "theme_color": "#1f2a5c",
+  "lang": "fr",
+  "icons": [{ "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }]
+}
