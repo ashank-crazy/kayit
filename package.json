@@ -1,0 +1,36 @@
+{
+  "name": "kayit",
+  "version": "0.1.0",
+  "description": "Kayit: the ndawtal notebook that cannot be lost, forged or forgotten. Ceremony gifts as Cashu ecash over Lightning, co-signed on Nostr.",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1 --port 5180",
+    "build": "vite build",
+    "preview": "vite preview --host 127.0.0.1 --port 4190",
+    "relay": "node server/relay.mjs",
+    "start": "npm run build && node server/serve.mjs",
+    "test": "vitest run",
+    "test:live": "KAYIT_LIVE=1 vitest run tests/live.test.ts",
+    "typecheck": "tsc --noEmit -p ."
+  },
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@cashu/cashu-ts": "^4.13.1",
+    "@noble/hashes": "^2.4.0",
+    "nostr-tools": "^2.26.0",
+    "preact": "^11.2.0",
+    "qrcode-generator": "^2.0.4",
+    "ws": "^8.23.0"
+  },
+  "devDependencies": {
+    "@preact/preset-vite": "^2.10.6",
+    "@types/ws": "^8.18.2",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.8",
+    "vitest": "^5.1.0"
+  },
+  "private": true
+}

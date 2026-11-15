@@ -1,0 +1,35 @@
+# One command: docker compose up --build   ->  http://localhost:8080
+# Runs Kayit (app + relay) and a local Cashu mint (Nutshell, FakeWallet: invoices pay themselves, no real sats).
+services:
+  kayit:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      # the mint URL as the BROWSER sees it
+      KAYIT_MINT: ${KAYIT_MINT:-http://localhost:3338}
+      KAYIT_TEST_MINT: "1"
+    volumes:
+      - relay-data:/app/data
+    depends_on:
+      - mint
+    restart: unless-stopped
+
+  mint:
+    image: cashubtc/nutshell:0.22.1
+    command: ["poetry", "run", "mint"]
+    ports:
+      - "3338:3338"
+    environment:
+      MINT_BACKEND_BOLT11_SAT: FakeWallet
+      MINT_LISTEN_HOST: 0.0.0.0
+      MINT_LISTEN_PORT: 3338
+      # test-only seed; a real mint needs its own secret and a real Lightning backend
+      MINT_MNEMONIC: abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about
+    volumes:
+      - mint-data:/app/data
+    restart: unless-stopped
+
+volumes:
+  relay-data:
+  mint-data:
