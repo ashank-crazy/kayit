@@ -1,0 +1,5 @@
+{
+  "mint": "https://testnut.cashu.space",
+  "relays": ["wss://nos.lol", "wss://relay.primal.net", "wss://nostr.mom"],
+  "testMint": true
+}
