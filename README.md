@@ -48,7 +48,7 @@ Everything is in French first (English available), amounts in **francs CFA**, sa
 
 ## Try it
 
-**Hosted MVP:** _link added at submission_ (static build on the public test mint and public relays)
+**Hosted MVP:** <https://ashank-crazy.github.io/kayit/> (static build on the public test mint and public relays)
 
 On the welcome screen tap **Essayer la démo**. It creates two notebooks on this phone:
 
@@ -98,6 +98,7 @@ runs the whole happy path for real: a local relay and the public test mint. Two 
 through a Lightning top‑up, a locked envelope, a receipt, a cash gift and a restore from 12 words.
 
 Server settings: `PORT`, `KAYIT_MINT`, `KAYIT_RELAYS` (extra relays, comma‑separated), `RELAY_DATA`.
+On a static host (GitHub Pages, any CDN), edit `kayit-config.json` next to `index.html` to change the mint or relays.
 
 ## How it works
 

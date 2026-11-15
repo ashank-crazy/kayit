@@ -16,8 +16,8 @@ The ndawtal notebook that can't be lost, forged or forgotten: ceremony gifts as 
 
 ## Links
 
-- Code: `https://github.com/<account>/kayit` (public)
-- Live MVP: `<hosted URL>` — tap **Essayer la démo**, PINs 1111 (Awa, host) and 2222 (Fatou, guest)
+- Code: https://github.com/ashank-crazy/kayit (public)
+- Live MVP: https://ashank-crazy.github.io/kayit/ — tap **Essayer la démo**, PINs 1111 (Awa, host) and 2222 (Fatou, guest)
 - Video: `<YouTube / Loom URL>`
 
 ## Built with
