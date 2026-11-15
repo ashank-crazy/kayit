@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useState } from 'preact/hooks';
 import type { Engine, Arrival } from '../core/engine';
 import type { CeremonyType } from '../core/protocol';
-import { invitationLink, parseGift } from '../core/protocol';
-import { parseXof, formatXof } from '../core/money';
+import { invitationLink, compactInvitationLink, parseGift } from '../core/protocol';
+import { drawInviteCard, canvasBlob, shareOrSave, cardFilename } from './card';
+import { parseXof, formatXof, formatSats } from '../core/money';
 import { t, fmtDate, lang } from '../app/i18n';
 import { Btn, Card, Field, Money, Notice, Qr, Screen, StatusBadge, Toast, copy, errMsg, go, useEngine, useToast } from './kit';
 
@@ -69,10 +70,43 @@ export function HostNew(props: { engine: Engine }) {
 export function InviteSheet(props: { engine: Engine; id: string }) {
   const c = props.engine.ceremonies().find((x) => x.id === props.id);
   const [toast, setToast] = useToast();
+  const [code, setCode] = useState<string | null>(null);
+  const [published, setPublished] = useState<boolean | null>(null);
+  const [card, setCard] = useState<HTMLCanvasElement | null>(null);
+  const [busy, setBusy] = useState(false);
+  const publish = () => {
+    if (!c) return;
+    setPublished(null);
+    props.engine
+      .inviteFor(c)
+      .then((r) => {
+        setCode(r.code);
+        setPublished(r.published);
+      })
+      .catch(() => setPublished(false));
+  };
+  useEffect(publish, [props.id]);
+  const longLink = c ? invitationLink(location.href, c) : '';
+  const link = c && code && published ? compactInvitationLink(location.href, code) : longLink;
+  useEffect(() => {
+    if (c && published !== null) setCard(drawInviteCard(c, link));
+  }, [link, published]);
+  const preview = useMemo(() => (card ? card.toDataURL('image/png') : null), [card]);
   if (!c) return <Screen title="?" back="" children={<Notice kind="error">404</Notice>} />;
-  const link = invitationLink(location.href, c);
   const msg = t('invite_msg', { host: c.hostName, title: c.title, date: fmtDate(c.start, { weekday: 'long', day: 'numeric', month: 'long' }) });
-  const share = async () => {
+  const shareCard = async () => {
+    if (!card) return;
+    setBusy(true);
+    try {
+      const r = await shareOrSave(await canvasBlob(card), cardFilename(c), `${msg}\n${link}`);
+      if (r === 'saved') setToast(t('card_saved'));
+    } catch (x) {
+      setToast(errMsg(x));
+    } finally {
+      setBusy(false);
+    }
+  };
+  const shareLink = async () => {
     if (navigator.share) {
       try {
         await navigator.share({ title: c.title, text: msg, url: link });
@@ -86,22 +120,44 @@ export function InviteSheet(props: { engine: Engine; id: string }) {
   return (
     <Screen title={t('invite')} back={`ceremony/${c.id}`}>
       <Card class="center">
-        <h2>{c.title}</h2>
-        <p class="muted">{fmtDate(c.start, { weekday: 'long', day: 'numeric', month: 'long' })}</p>
-        <Qr text={link} label={t('invite_scan')} />
+        {preview ? <img class="invite-card-img" src={preview} alt={`${c.title} · ${t('card_scan')}`} /> : <Qr text={link} label={t('invite_scan')} />}
         <p class="muted small">{t('invite_scan')}</p>
-        {c.capXof && <span class="badge">{t('cap_badge', { amount: formatXof(c.capXof) })}</span>}
+        {published === null && <p class="muted small">{t('invite_publishing')}</p>}
+        {published === true && <p class="ok-text small">✓ {t('invite_ready')}</p>}
       </Card>
+      {published === false && (
+        <Notice kind="warn">
+          {t('invite_unpublished')}{' '}
+          <button class="link" onClick={publish}>
+            {t('retry')}
+          </button>
+        </Notice>
+      )}
       <div class="stack">
-        <Btn onClick={share}>{t('invite_share')}</Btn>
+        <Btn onClick={shareCard} busy={busy} disabled={!card}>
+          {t('invite_card')}
+        </Btn>
+        <Btn kind="ghost" onClick={shareLink}>
+          {t('invite_send_link')}
+        </Btn>
         <Btn
-          kind="ghost"
+          kind="quiet"
           onClick={async () => {
             setToast((await copy(link)) ? t('copied') : link);
           }}
         >
           {t('invite_copy')}
         </Btn>
+        {link !== longLink && (
+          <Btn
+            kind="quiet"
+            onClick={async () => {
+              setToast((await copy(longLink)) ? t('copied') : longLink);
+            }}
+          >
+            {t('invite_long')}
+          </Btn>
+        )}
         <Btn kind="quiet" onClick={() => go(`ceremony/${c.id}`)}>
           {t('board')} →
         </Btn>
@@ -181,6 +237,11 @@ export function Board(props: { engine: Engine; id: string }) {
           </label>
         </div>
       </section>
+
+      <Btn kind="ghost" onClick={() => go(`ceremony/${c.id}/scan`)}>
+        📷 {t('scan_envelope')}
+      </Btn>
+      {e.toRedeemSats() > 0 && <p class="muted small center">{t('to_redeem', { sats: formatSats(e.toRedeemSats()) })}</p>}
 
       {err && <Notice kind="error">{err}</Notice>}
 

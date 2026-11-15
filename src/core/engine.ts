@@ -14,6 +14,14 @@ import {
   receiptMatches,
   tokenHash,
   randomId,
+  newInviteSeed,
+  inviteCode,
+  inviteKeys,
+  parseInviteCode,
+  createInviteCarrier,
+  openInviteCarriers,
+  bytesToB64Url,
+  b64UrlToBytes,
   cleanText,
   now,
   type Ceremony,
@@ -25,6 +33,7 @@ import { type Entry, type Direction, upsertEntry, nameKey } from './ledger';
 import { FALLBACK_RATE, fetchRate, xofToSats, assertAmount, type Rate } from './money';
 import * as W from './wallet';
 import * as T from './transport';
+import type { AirMessage } from './airgap';
 
 export interface Settings {
   name: string;
@@ -46,9 +55,26 @@ export interface OutEnvelope {
   ceremonyTitle: string;
   sats: number;
   xof: number;
-  state: 'sent' | 'opened' | 'reclaimed';
+  /** prepared: made at home, not yet handed over; handed: the host holds it (receipt seen), not redeemed yet */
+  state: 'prepared' | 'sent' | 'handed' | 'opened' | 'reclaimed';
   at: number;
 }
+
+/** An envelope a guest handed over in person (QR, no network); redeemed and receipted once online. */
+export interface HandedIn {
+  giftId: string;
+  giverPk: string;
+  token: string;
+  mint: string;
+  sats: number;
+  receivedAt: number;
+  redeemed: boolean;
+  receiptSent: boolean;
+  problem?: string;
+}
+
+/** Offline acceptance needs time to reach the mint before the giver's refund key wakes up. */
+const OFFLINE_LOCK_MARGIN = 2 * 86400;
 
 export interface PendingIn {
   gift: NostrEvent;
@@ -65,10 +91,15 @@ export interface State {
   proofs: W.StoredProofs;
   topups: W.TopUp[];
   myCeremonies: NostrEvent[];
+  /** ceremony ref -> base64url seed of its compact invitation */
+  inviteSeeds?: Record<string, string>;
   invitations: NostrEvent[];
   entries: Entry[];
   outbox: OutEnvelope[];
   pending: PendingIn[];
+  handed?: HandedIn[];
+  /** the mint's public keys, kept so envelopes can be checked with no network */
+  mintCache?: W.MintCache;
   processed: string[];
   rate: Rate;
   lastSync?: number;
@@ -126,6 +157,7 @@ export class Engine {
     this.id = id;
     this.state = state;
     this.persistFn = persist;
+    if (state.mintCache) W.primeMintCache(state.mint, state.mintCache);
   }
 
   /* ------------------------------------------------------------ plumbing */
@@ -191,6 +223,15 @@ export class Engine {
     fetchRate()
       .then((rate) => this.commit((s) => ({ ...s, rate }), false))
       .catch(() => undefined);
+    this.refreshMintKeys().catch(() => undefined);
+    this.flushHanded().catch(() => undefined);
+  }
+
+  /** Keep the mint's public keys for offline days (only rewrites the notebook when they change). */
+  async refreshMintKeys(): Promise<void> {
+    const cache = await W.snapshotMint(this.state.mint);
+    const ids = (c?: W.MintCache) => (c ? c.keychain.keysets.map((k) => `${k.id}:${k.keys ? 1 : 0}`).join(',') : '');
+    if (ids(cache) !== ids(this.state.mintCache)) await this.commit((s) => ({ ...s, mintCache: cache }), false);
   }
 
   stop(): void {
@@ -285,6 +326,40 @@ export class Engine {
     return c;
   }
 
+  /**
+   * The short invitation code for one of my ceremonies. Creates the seed once, then (re)publishes the
+   * encrypted carrier so the code resolves on relays. `published` is false when no relay accepted it.
+   */
+  async inviteFor(c: Ceremony): Promise<{ code: string; published: boolean }> {
+    if (c.hostPk !== this.id.pk) throw new Error('not my ceremony');
+    let seedB64 = this.state.inviteSeeds?.[c.ref];
+    if (!seedB64) {
+      const fresh = bytesToB64Url(newInviteSeed());
+      await this.commit((s) => ({ ...s, inviteSeeds: { ...(s.inviteSeeds ?? {}), [c.ref]: s.inviteSeeds?.[c.ref] ?? fresh } }));
+      seedB64 = this.state.inviteSeeds![c.ref];
+    }
+    const seed = b64UrlToBytes(seedB64);
+    const code = inviteCode(seed, this.id.pk);
+    try {
+      await T.publishInvite(this.relaysFor(c), createInviteCarrier(c, seed));
+      return { code, published: true };
+    } catch {
+      return { code, published: false };
+    }
+  }
+
+  /** Resolve a short invitation code from relays; keeps the ceremony in my invitations. */
+  async openInviteCode(code: string): Promise<Ceremony | null> {
+    const parsed = parseInviteCode(code);
+    if (!parsed) return null;
+    const mine = this.ceremonies().find((c) => c.hostPk.startsWith(parsed.hostPrefix) && this.state.inviteSeeds?.[c.ref] && inviteCode(b64UrlToBytes(this.state.inviteSeeds[c.ref]), c.hostPk) === code);
+    if (mine) return mine;
+    const events = await T.fetchInviteCarriers(this.state.relays, inviteKeys(parsed.seed).pk);
+    const c = openInviteCarriers(events, code);
+    if (c) await this.addInvitation(c);
+    return c;
+  }
+
   async addInvitation(c: Ceremony): Promise<void> {
     if (c.hostPk === this.id.pk) return;
     if (this.state.invitations.some((e) => e.id === c.event.id)) return;
@@ -293,39 +368,171 @@ export class Engine {
 
   /* ------------------------------------------------------------ giving */
 
+  /** Lock ecash to the host, sign the gift and keep it in my outbox (needs the mint, so needs network). */
+  private async makeEnvelopeGift(c: Ceremony, xof: number, message: string, state: OutEnvelope['state']): Promise<Gift> {
+    if (c.capXof && xof > c.capXof) throw new Error('over-cap');
+    if (W.normalizeMint(c.mint) !== this.state.mint) throw new Error('other-mint');
+    const sats = xofToSats(xof, this.state.rate);
+    if (this.balanceSats() < sats) throw new Error('insufficient');
+    const locktime = Math.max(c.start, now()) + LOCK_GRACE_DAYS * 86400;
+    const { keep, token } = await W.makeEnvelope(this.state.mint, this.state.proofs, sats, c.lockPk, locktime, this.id.lockPk);
+    const gift = createGift(this.id.sk, { ceremony: c, giverName: this.state.settings.name, xof, method: 'ecash', sats, token, message });
+    const env: OutEnvelope = {
+      giftId: gift.id,
+      token,
+      mint: this.state.mint,
+      locktime,
+      hostPk: c.hostPk,
+      hostName: c.hostName,
+      ceremonyTitle: c.title,
+      sats,
+      xof,
+      state,
+      at: now(),
+    };
+    await this.commit((s) => ({
+      ...s,
+      proofs: W.toStored(keep),
+      outbox: [...s.outbox, env],
+      entries: upsertEntry(s.entries, this.outEntry(gift, c)),
+    }));
+    await this.addInvitation(c);
+    return gift;
+  }
+
   /** Prepare an ecash envelope locked to the host, sign the gift, and deliver both over Nostr. */
   giveEcash(c: Ceremony, xof: number, message = ''): Promise<Gift> {
     assertAmount(xof);
     return this.exclusive(async () => {
-      if (c.capXof && xof > c.capXof) throw new Error('over-cap');
-      if (W.normalizeMint(c.mint) !== this.state.mint) throw new Error('other-mint');
-      const sats = xofToSats(xof, this.state.rate);
-      if (this.balanceSats() < sats) throw new Error('insufficient');
-      const locktime = Math.max(c.start, now()) + LOCK_GRACE_DAYS * 86400;
-      const { keep, token } = await W.makeEnvelope(this.state.mint, this.state.proofs, sats, c.lockPk, locktime, this.id.lockPk);
-      const gift = createGift(this.id.sk, { ceremony: c, giverName: this.state.settings.name, xof, method: 'ecash', sats, token, message });
-      const env: OutEnvelope = {
-        giftId: gift.id,
-        token,
-        mint: this.state.mint,
-        locktime,
-        hostPk: c.hostPk,
-        hostName: c.hostName,
-        ceremonyTitle: c.title,
-        sats,
-        xof,
-        state: 'sent',
-        at: now(),
-      };
+      const gift = await this.makeEnvelopeGift(c, xof, message, 'sent');
+      await T.sendEnvelope(this.id.sk, this.id.pk, c.hostPk, { t: 'gift', gift: gift.event, token: this.state.outbox.find((o) => o.giftId === gift.id)!.token, ceremony: c.event }, this.relaysFor(c));
+      return gift;
+    });
+  }
+
+  /**
+   * Prepare the envelope at home, hand it over at the ceremony: the host's phone reads it from a QR and
+   * can check it with no network. Until handed over it stays in my outbox (and comes back after the lock).
+   */
+  prepareEnvelope(c: Ceremony, xof: number, message = ''): Promise<Gift> {
+    assertAmount(xof);
+    return this.exclusive(() => this.makeEnvelopeGift(c, xof, message, 'prepared'));
+  }
+
+  /** What the QR animation carries for a prepared envelope. */
+  handoverMessage(giftId: string): AirMessage {
+    const env = this.state.outbox.find((o) => o.giftId === giftId);
+    const gift = this.state.entries.find((e) => e.id === giftId)?.gift;
+    if (!env || !gift) throw new Error('no such envelope');
+    return { kind: 'envelope', gift, token: env.token };
+  }
+
+  /** Changed my mind: deliver a prepared envelope over the internet instead. */
+  sendPrepared(giftId: string): Promise<void> {
+    return this.exclusive(async () => {
+      const env = this.state.outbox.find((o) => o.giftId === giftId);
+      const gift = this.state.entries.find((e) => e.id === giftId)?.gift;
+      if (!env || !gift || env.state !== 'prepared') throw new Error('nothing to send');
+      const c = this.findCeremony(parseGift(gift)?.ceremonyRef ?? '');
+      await T.sendEnvelope(this.id.sk, this.id.pk, env.hostPk, { t: 'gift', gift, token: env.token, ceremony: c?.event }, c ? this.relaysFor(c) : this.state.relays);
+      await this.commit((s) => ({ ...s, outbox: s.outbox.map((o) => (o.giftId === giftId ? { ...o, state: 'sent' } : o)) }));
+    });
+  }
+
+  /** Giver: the host's receipt read from their screen. */
+  acceptScannedReceipt(m: AirMessage): Promise<Entry> {
+    return this.exclusive(async () => {
+      if (m.kind !== 'receipt') throw new Error('not-a-receipt');
+      const receipt = parseReceipt(m.receipt);
+      if (!receipt) throw new Error('bad-signature');
+      const mine = this.state.entries.find((e) => e.id === receipt.giftId && e.direction === 'out' && e.gift);
+      if (!mine) throw new Error('unknown-gift');
+      await this.onReceipt(receipt.hostPk, { t: 'receipt', receipt: m.receipt, gift: mine.gift! });
+      const e = this.state.entries.find((x) => x.id === receipt.giftId)!;
+      if (e.status !== 'cosigned') throw new Error('bad-signature');
+      return e;
+    });
+  }
+
+  /**
+   * Host: a guest's envelope read from their screen, with no network needed. Everything is checked
+   * against the mint keys I kept: the gift signature, that it is for one of my ceremonies, that the token
+   * matches the signed hash, is locked to me alone, carries the mint's DLEQ proofs, covers the amount and
+   * stays locked long enough for me to reach the mint. Then I sign the receipt at once; the sats are
+   * redeemed when the network is back.
+   */
+  acceptHanded(m: AirMessage): Promise<{ gift: Gift; receipt: NostrEvent; already: boolean }> {
+    return this.exclusive(async () => {
+      if (m.kind !== 'envelope') throw new Error('not-an-envelope');
+      const gift = parseGift(m.gift);
+      if (!gift || gift.method !== 'ecash') throw new Error('bad-signature');
+      if (gift.hostPk !== this.id.pk) throw new Error('not-for-me');
+      const mine = this.ceremonies().find((c) => c.ref === gift.ceremonyRef);
+      if (!mine) throw new Error('not-my-ceremony');
+      const existing = this.state.entries.find((e) => e.id === gift.id);
+      if (existing?.receipt) return { gift, receipt: existing.receipt, already: true };
+      if (tokenHash(m.token) !== gift.tokenHash) throw new Error('token-mismatch');
+      const check = await W.inspectEnvelope(m.token, mine.mint, this.id.lockPk, { offline: true });
+      if (!check.ok) throw new Error(check.reason ?? 'bad-token');
+      if (check.sats < (gift.sats ?? 0)) throw new Error('short');
+      if ((check.locktime ?? Infinity) - now() < OFFLINE_LOCK_MARGIN) throw new Error('lock-expiring');
+      const receipt = createReceipt(this.id.sk, gift, 'received', 'Jërëjëf');
+      const item: HandedIn = { giftId: gift.id, giverPk: gift.giverPk, token: m.token, mint: mine.mint, sats: check.sats, receivedAt: now(), redeemed: false, receiptSent: false };
       await this.commit((s) => ({
         ...s,
-        proofs: W.toStored(keep),
-        outbox: [...s.outbox, env],
-        entries: upsertEntry(s.entries, this.outEntry(gift, c)),
+        handed: [...(s.handed ?? []).filter((h) => h.giftId !== gift.id), item],
+        entries: upsertEntry(s.entries, this.inEntry(gift, mine, 'cosigned', receipt.event)),
       }));
-      await this.addInvitation(c);
-      await T.sendEnvelope(this.id.sk, this.id.pk, c.hostPk, { t: 'gift', gift: gift.event, token, ceremony: c.event }, this.relaysFor(c));
-      return gift;
+      this.announce(gift, 'cosigned');
+      this.flushHanded().catch(() => undefined);
+      return { gift, receipt: receipt.event, already: false };
+    });
+  }
+
+  /** Sats from handed envelopes not redeemed yet. */
+  toRedeemSats(): number {
+    return (this.state.handed ?? []).filter((h) => !h.redeemed).reduce((a, h) => a + h.sats, 0);
+  }
+
+  /** Once online: redeem envelopes received in person, and send their receipts over Nostr. */
+  flushHanded(): Promise<void> {
+    return this.exclusive(async () => {
+      for (const h of this.state.handed ?? []) {
+        if (!h.redeemed) {
+          try {
+            const proofs = await W.openEnvelope(h.mint, h.token, this.id.lockSkHex);
+            // now cashed: replace the offline 'received' receipt with a 'redeemed' one, and send that instead
+            const entry = this.state.entries.find((e) => e.id === h.giftId);
+            const gift = entry?.gift ? parseGift(entry.gift) : null;
+            const redeemed = gift ? createReceipt(this.id.sk, gift, 'redeemed', 'Jërëjëf').event : undefined;
+            await this.commit((s) => ({
+              ...s,
+              proofs: [...s.proofs, ...W.toStored(proofs)],
+              handed: (s.handed ?? []).map((x) => (x.giftId === h.giftId ? { ...x, redeemed: true, receiptSent: redeemed ? false : x.receiptSent, problem: undefined } : x)),
+              entries: redeemed ? s.entries.map((e) => (e.id === h.giftId ? { ...e, receipt: redeemed } : e)) : s.entries,
+            }));
+          } catch (e) {
+            const st = await W.envelopeState(h.mint, h.token).catch(() => 'offline');
+            if (st === 'offline') return; // no network yet: try again later
+            if (st === 'spent') {
+              await this.commit((s) => ({ ...s, handed: (s.handed ?? []).map((x) => (x.giftId === h.giftId ? { ...x, redeemed: true, problem: 'already-opened' } : x)) }));
+            } else {
+              await this.commit((s) => ({ ...s, handed: (s.handed ?? []).map((x) => (x.giftId === h.giftId ? { ...x, problem: String((e as Error).message ?? e) } : x)) }));
+            }
+          }
+        }
+        const fresh = (this.state.handed ?? []).find((x) => x.giftId === h.giftId);
+        const entry = this.state.entries.find((e) => e.id === h.giftId);
+        if (fresh && !fresh.receiptSent && entry?.gift && entry.receipt) {
+          const c = this.findCeremony(parseGift(entry.gift)?.ceremonyRef ?? '');
+          try {
+            await T.sendEnvelope(this.id.sk, this.id.pk, h.giverPk, { t: 'receipt', receipt: entry.receipt, gift: entry.gift, ceremony: c?.event }, c ? this.relaysFor(c) : this.state.relays);
+            await this.commit((s) => ({ ...s, handed: (s.handed ?? []).map((x) => (x.giftId === h.giftId ? { ...x, receiptSent: true } : x)) }));
+          } catch {
+            return; // offline: next time
+          }
+        }
+      }
     });
   }
 
@@ -346,7 +553,7 @@ export class Engine {
   reclaim(giftId: string): Promise<number> {
     return this.exclusive(async () => {
       const env = this.state.outbox.find((o) => o.giftId === giftId);
-      if (!env || env.state !== 'sent') throw new Error('nothing to reclaim');
+      if (!env || !['sent', 'prepared', 'handed'].includes(env.state)) throw new Error('nothing to reclaim');
       if (now() < env.locktime) throw new Error('still-locked');
       const st = await W.envelopeState(env.mint, env.token);
       if (st === 'spent') {
@@ -557,7 +764,9 @@ export class Engine {
       await this.commit((s) => ({
         ...s,
         entries: upsertEntry(s.entries, { ...this.outEntry(gift, c, receipt.event), counterpartName: c?.hostName ?? s.entries.find((e) => e.id === gift.id)?.counterpartName ?? 'Hôte' }),
-        outbox: s.outbox.map((o) => (o.giftId === gift.id && receipt.status === 'redeemed' ? { ...o, state: 'opened' } : o)),
+        outbox: s.outbox.map((o) =>
+          o.giftId !== gift.id ? o : receipt.status === 'redeemed' ? { ...o, state: 'opened' } : o.state === 'prepared' || o.state === 'sent' ? { ...o, state: 'handed' } : o,
+        ),
       }));
     } else if (receipt.hostPk === this.id.pk) {
       // my own copy of a receipt I issued (restore on a new phone without a backup)

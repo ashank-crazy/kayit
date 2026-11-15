@@ -17,6 +17,8 @@ import {
   CheckStateEnum,
   type Proof,
   type MintQuoteBolt11Response,
+  type GetInfoResponse,
+  type KeyChainCache,
 } from '@cashu/cashu-ts';
 
 export type StoredProofs = string[];
@@ -31,10 +33,19 @@ export interface TopUp {
 export interface Inspection {
   ok: boolean;
   sats: number;
-  reason?: 'bad-token' | 'wrong-mint' | 'not-locked-to-me' | 'bad-signature' | 'empty';
+  /** earliest lock expiry among the proofs: after it, the giver can take the envelope back */
+  locktime?: number;
+  reason?: 'bad-token' | 'wrong-mint' | 'not-locked-to-me' | 'bad-signature' | 'empty' | 'no-mint-keys' | 'lock-expiring';
+}
+
+/** The mint's public info and keys: enough to check an envelope's signatures with no network. */
+export interface MintCache {
+  info: GetInfoResponse;
+  keychain: KeyChainCache;
 }
 
 const wallets = new Map<string, Promise<Wallet>>();
+const caches = new Map<string, MintCache>();
 
 export function normalizeMint(url: string): string {
   return url.trim().replace(/\/+$/, '');
@@ -52,6 +63,29 @@ export async function loadWallet(mintUrl: string): Promise<Wallet> {
     wallets.set(key, w);
     w.catch(() => wallets.delete(key));
   }
+  return w;
+}
+
+/** Give the wallet module a cache saved earlier (from the encrypted notebook). */
+export function primeMintCache(mintUrl: string, cache: MintCache): void {
+  caches.set(normalizeMint(mintUrl), cache);
+}
+
+/** Fetch the mint's keys now (online) and return the sat-only cache to keep for offline days. */
+export async function snapshotMint(mintUrl: string): Promise<MintCache> {
+  const w = await loadWallet(mintUrl);
+  const kc = w.keyChain.cache;
+  const cache: MintCache = { info: w.getMintInfo().cache, keychain: { ...kc, keysets: kc.keysets.filter((k) => k.unit === 'sat') } };
+  caches.set(normalizeMint(mintUrl), cache);
+  return cache;
+}
+
+/** A wallet built only from cached keys: never touches the network. */
+function offlineWallet(mintUrl: string): Wallet | null {
+  const c = caches.get(normalizeMint(mintUrl));
+  if (!c) return null;
+  const w = new Wallet(normalizeMint(mintUrl));
+  w.loadMintFromCache(c.info, c.keychain);
   return w;
 }
 
@@ -130,7 +164,7 @@ export async function makeEnvelope(
 }
 
 /** Offline checks before redeeming: right mint, locked to me, signed by the mint (NUT-12 DLEQ). */
-export async function inspectEnvelope(token: string, expectedMint: string, myLockPk: string): Promise<Inspection> {
+export async function inspectEnvelope(token: string, expectedMint: string, myLockPk: string, opts: { offline?: boolean } = {}): Promise<Inspection> {
   let meta;
   try {
     meta = getTokenMetadata(token);
@@ -140,22 +174,42 @@ export async function inspectEnvelope(token: string, expectedMint: string, myLoc
   if (normalizeMint(meta.mint) !== normalizeMint(expectedMint) || meta.unit !== 'sat') {
     return { ok: false, sats: 0, reason: 'wrong-mint' };
   }
-  const w = await loadWallet(expectedMint);
-  const decoded = w.decodeToken(token);
+  let w: Wallet | null;
+  if (opts.offline) {
+    w = offlineWallet(expectedMint);
+    if (!w) return { ok: false, sats: 0, reason: 'no-mint-keys' };
+  } else w = await loadWallet(expectedMint);
+  let decoded;
+  try {
+    decoded = w.decodeToken(token);
+  } catch {
+    return { ok: false, sats: 0, reason: opts.offline ? 'no-mint-keys' : 'bad-token' };
+  }
   if (!decoded.proofs.length) return { ok: false, sats: 0, reason: 'empty' };
   const mine = myLockPk.toLowerCase();
+  let locktime = Infinity;
   for (const p of decoded.proofs) {
     try {
       const v = verifyP2PKSpendingConditions(p);
       const keys = v.main.pubkeys.map((k) => k.toLowerCase());
       if (!keys.includes(mine) && !keys.includes(mine.slice(2))) return { ok: false, sats: 0, reason: 'not-locked-to-me' };
+      // my key alone must be enough: an envelope that also needs the giver's signature is worthless to me
+      if (v.main.requiredSigners > 1) return { ok: false, sats: 0, reason: 'not-locked-to-me' };
+      if (v.lockState === 'EXPIRED') return { ok: false, sats: 0, reason: 'lock-expiring' };
+      locktime = Math.min(locktime, v.locktime);
     } catch {
       return { ok: false, sats: 0, reason: 'not-locked-to-me' };
     }
   }
-  const check = await w.verifyMintSignatures(decoded.proofs, { require: true });
+  let check;
+  try {
+    check = await w.verifyMintSignatures(decoded.proofs, { require: true });
+  } catch {
+    // offline and the envelope uses a keyset we never saw: we cannot vouch for it yet
+    return { ok: false, sats: 0, reason: opts.offline ? 'no-mint-keys' : 'bad-signature' };
+  }
   if (check.invalid.length) return { ok: false, sats: 0, reason: 'bad-signature' };
-  return { ok: true, sats: sumProofs(decoded.proofs).toNumber() };
+  return { ok: true, sats: sumProofs(decoded.proofs).toNumber(), locktime };
 }
 
 /** Open an envelope locked to me (host) or, after expiry, take it back (giver's refund key). */

@@ -11,6 +11,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import zlib from 'node:zlib';
 import { createRelay } from './relay.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'dist');
@@ -34,7 +35,8 @@ const SECURITY = {
   'X-Content-Type-Options': 'nosniff',
   'Referrer-Policy': 'no-referrer',
   'X-Frame-Options': 'DENY',
-  'Permissions-Policy': 'camera=(), microphone=(), geolocation=()',
+  // the camera is only for scanning envelopes at a ceremony, and only for this page
+  'Permissions-Policy': 'camera=(self), microphone=(), geolocation=()',
 };
 
 if (!fs.existsSync(path.join(root, 'index.html'))) {
@@ -52,21 +54,45 @@ const server = http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
     return res.end(`ok events=${relay.size()}`);
   }
-  let file = path.normalize(path.join(root, decodeURIComponent(url.pathname)));
-  if (!file.startsWith(root)) {
+  let file;
+  try {
+    file = path.normalize(path.join(root, decodeURIComponent(url.pathname)));
+  } catch {
+    res.writeHead(400);
+    return res.end(); // malformed %-encoding
+  }
+  if (file !== root && !file.startsWith(root + path.sep)) {
     res.writeHead(403);
     return res.end();
   }
   if (!fs.existsSync(file) || fs.statSync(file).isDirectory()) file = path.join(root, 'index.html');
-  const ext = path.extname(file);
-  const immutable = file.includes(`${path.sep}assets${path.sep}`);
+  const asset = load(file);
+  const gzip = asset.gz && /\bgzip\b/.test(req.headers['accept-encoding'] || '');
+  const body = gzip ? asset.gz : asset.raw;
   res.writeHead(200, {
-    'Content-Type': TYPES[ext] || 'application/octet-stream',
-    'Cache-Control': immutable ? 'public, max-age=31536000, immutable' : 'no-cache',
+    'Content-Type': asset.type,
+    'Content-Length': body.length,
+    'Cache-Control': file.includes(`${path.sep}assets${path.sep}`) ? 'public, max-age=31536000, immutable' : 'no-cache',
+    Vary: 'Accept-Encoding',
+    ...(gzip ? { 'Content-Encoding': 'gzip' } : {}),
     ...SECURITY,
   });
-  fs.createReadStream(file).pipe(res);
+  res.end(req.method === 'HEAD' ? undefined : body);
 });
+
+/** dist/ is small and immutable while the server runs: keep each file (and its gzip) in memory. */
+const cache = new Map();
+function load(file) {
+  let a = cache.get(file);
+  if (!a) {
+    const raw = fs.readFileSync(file);
+    const type = TYPES[path.extname(file)] || 'application/octet-stream';
+    const gz = /text|json|svg|manifest/.test(type) && raw.length > 1024 ? zlib.gzipSync(raw, { level: 9 }) : null;
+    a = { raw, gz, type };
+    cache.set(file, a);
+  }
+  return a;
+}
 
 const relay = createRelay({ server, path: '/relay', dataFile: process.env.RELAY_DATA || 'data/relay.jsonl' });
 

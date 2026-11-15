@@ -175,12 +175,26 @@ export function Caisse(props: { engine: Engine }) {
                 <div class="grow">
                   <strong>{o.hostName}</strong> · <span class="muted">{o.ceremonyTitle}</span>
                   <div class="muted small">
-                    {o.state === 'sent' ? (now < o.locktime ? `${t('e_sent')} · ${t('reclaim_after', { date: fmtDate(o.locktime) })}` : t('e_sent')) : o.state === 'opened' ? t('e_opened') : t('e_reclaimed')}
+                    {o.state === 'prepared' ? (
+                      <button class="link" onClick={() => go(`envelope/${o.giftId}`)}>
+                        {t('e_prepared')} →
+                      </button>
+                    ) : o.state === 'sent' || o.state === 'handed' ? (
+                      now < o.locktime ? (
+                        `${t(o.state === 'sent' ? 'e_sent' : 'e_handed')} · ${t('reclaim_after', { date: fmtDate(o.locktime) })}`
+                      ) : (
+                        t(o.state === 'sent' ? 'e_sent' : 'e_handed')
+                      )
+                    ) : o.state === 'opened' ? (
+                      t('e_opened')
+                    ) : (
+                      t('e_reclaimed')
+                    )}
                   </div>
                 </div>
                 <div class="right">
                   <Money xof={o.xof} />
-                  {o.state === 'sent' && now >= o.locktime && (
+                  {(o.state === 'sent' || o.state === 'prepared' || o.state === 'handed') && now >= o.locktime && (
                     <Btn kind="quiet" onClick={() => e.reclaim(o.giftId).then((n) => setToast(`+${formatSats(n)}`)).catch((x) => setErr(errMsg(x)))}>
                       {t('reclaim')}
                     </Btn>

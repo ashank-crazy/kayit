@@ -8,7 +8,10 @@ import { SimplePool } from 'nostr-tools/pool';
 import { finalizeEvent, type NostrEvent } from 'nostr-tools/pure';
 import { wrapEvent, unwrapEvent } from 'nostr-tools/nip59';
 import * as nip44 from 'nostr-tools/nip44';
-import { KIND_ENVELOPE, KIND_BACKUP, BACKUP_D, parseEnvelope, type EnvelopePayload, now } from './protocol';
+import { KIND_ENVELOPE, KIND_BACKUP, KIND_INVITE, BACKUP_D, parseEnvelope, type EnvelopePayload, now, bytesToB64Url, b64UrlToBytes } from './protocol';
+import { sha256 } from '@noble/hashes/sha2.js';
+import { bytesToHex } from '@noble/hashes/utils.js';
+import { deflate, inflate } from './zip';
 
 export interface Inbound {
   wrapId: string;
@@ -88,25 +91,119 @@ export function subscribeInbox(
 
 /* -------------------------------------------------------------- encrypted backup */
 
+/*
+ * The backup is the whole notebook, so it grows with every gift (~2 KB per signed line) while NIP-44 caps
+ * one message at 64 KB. v2 compresses it and splits it into numbered parts plus a manifest, all
+ * NIP-44 encrypted to myself. v1 (one event) is still read for older backups.
+ *
+ * Parts live in two slots, a and b. A new backup is written into the slot the current manifest does not
+ * use, and the manifest is switched last, so a save cut off half-way (tab closed, network gone) never
+ * damages the backup that is already there.
+ */
+const BACKUP_V2 = 'kayit:backup:v2';
+const BACKUP_PART_CHARS = 30_000; // keeps each encrypted event under common 64 KB relay limits
+const BACKUP_MAX_PARTS = 24;
+
+export async function packBackup(state: unknown): Promise<{ id: string; parts: string[] }> {
+  const packed = bytesToB64Url(await deflate(new TextEncoder().encode(JSON.stringify(state))));
+  const parts: string[] = [];
+  for (let i = 0; i < packed.length; i += BACKUP_PART_CHARS) parts.push(packed.slice(i, i + BACKUP_PART_CHARS));
+  if (parts.length > BACKUP_MAX_PARTS) throw new Error('backup too large');
+  return { id: bytesToHex(sha256(new TextEncoder().encode(packed))).slice(0, 16), parts };
+}
+
+export async function unpackBackup<T>(id: string, parts: string[]): Promise<T> {
+  const packed = parts.join('');
+  if (bytesToHex(sha256(new TextEncoder().encode(packed))).slice(0, 16) !== id) throw new Error('backup parts do not match');
+  return JSON.parse(new TextDecoder().decode(await inflate(b64UrlToBytes(packed)))) as T;
+}
+
+type Slot = 'a' | 'b';
+const partTag = (slot: Slot, i: number) => `${BACKUP_V2}:${slot}:${i}`;
+interface Manifest {
+  id: string;
+  n: number;
+  slot: Slot;
+}
+
+function readManifest(ev: NostrEvent | undefined, key: Uint8Array): Manifest | null {
+  if (!ev) return null;
+  try {
+    const m = JSON.parse(nip44.decrypt(ev.content, key)) as Manifest;
+    return typeof m.id === 'string' && Number.isInteger(m.n) && m.n > 0 && m.n <= BACKUP_MAX_PARTS && (m.slot === 'a' || m.slot === 'b') ? m : null;
+  } catch {
+    return null;
+  }
+}
+
+function newest(events: NostrEvent[]): Map<string, NostrEvent> {
+  const latest = new Map<string, NostrEvent>();
+  for (const ev of events) {
+    const d = ev.tags.find((t) => t[0] === 'd')?.[1];
+    if (d && (!latest.has(d) || latest.get(d)!.created_at < ev.created_at)) latest.set(d, ev);
+  }
+  return latest;
+}
+
 export async function publishBackup(sk: Uint8Array, pk: string, relays: string[], state: unknown): Promise<number> {
   const key = nip44.getConversationKey(sk, pk);
-  const content = nip44.encrypt(JSON.stringify(state), key);
-  const ev = finalizeEvent({ kind: KIND_BACKUP, created_at: now(), tags: [['d', BACKUP_D]], content }, sk);
-  return publishAll(relays, ev);
+  const { id, parts } = await packBackup(state);
+  // write into the slot the live manifest does not point to
+  const live = await getPool()
+    .querySync(relays, { kinds: [KIND_BACKUP], authors: [pk], '#d': [BACKUP_V2] }, { maxWait: 3000 })
+    .then((evs) => readManifest(newest(evs).get(BACKUP_V2), key))
+    .catch(() => null);
+  const slot: Slot = live?.slot === 'a' ? 'b' : 'a';
+  const at = now();
+  const part = (i: number) =>
+    finalizeEvent({ kind: KIND_BACKUP, created_at: at, tags: [['d', partTag(slot, i)]], content: nip44.encrypt(JSON.stringify({ id, i, p: parts[i] }), key) }, sk);
+  for (let i = 0; i < parts.length; i++) await publishAll(relays, part(i));
+  // the manifest goes last, so a reader never sees a manifest whose parts are missing
+  const manifest = finalizeEvent({ kind: KIND_BACKUP, created_at: at, tags: [['d', BACKUP_V2]], content: nip44.encrypt(JSON.stringify({ id, n: parts.length, slot } satisfies Manifest), key) }, sk);
+  return publishAll(relays, manifest);
 }
 
 export async function fetchBackup<T>(sk: Uint8Array, pk: string, relays: string[]): Promise<{ state: T; at: number } | null> {
-  const events = await getPool().querySync(relays, { kinds: [KIND_BACKUP], authors: [pk], '#d': [BACKUP_D] }, { maxWait: 6000 });
-  const latest = events.sort((a, b) => b.created_at - a.created_at)[0];
-  if (!latest) return null;
+  const ds = [BACKUP_D, BACKUP_V2];
+  for (const slot of ['a', 'b'] as const) for (let i = 0; i < BACKUP_MAX_PARTS; i++) ds.push(partTag(slot, i));
+  const events = await getPool().querySync(relays, { kinds: [KIND_BACKUP], authors: [pk], '#d': ds }, { maxWait: 6000 });
+  const latest = newest(events);
   const key = nip44.getConversationKey(sk, pk);
-  return { state: JSON.parse(nip44.decrypt(latest.content, key)) as T, at: latest.created_at };
+  const manifest = latest.get(BACKUP_V2);
+  const m = readManifest(manifest, key);
+  if (manifest && m) {
+    try {
+      const parts: string[] = [];
+      for (let i = 0; i < m.n; i++) {
+        const ev = latest.get(partTag(m.slot, i));
+        const p = ev ? (JSON.parse(nip44.decrypt(ev.content, key)) as { id: string; i: number; p: string }) : null;
+        if (!p || p.id !== m.id || p.i !== i) throw new Error('missing part');
+        parts.push(p.p);
+      }
+      return { state: await unpackBackup<T>(m.id, parts), at: manifest.created_at };
+    } catch {
+      /* parts lost by every relay: fall back to v1 if there is one */
+    }
+  }
+  const v1 = latest.get(BACKUP_D);
+  if (!v1) return null;
+  return { state: JSON.parse(nip44.decrypt(v1.content, key)) as T, at: v1.created_at };
 }
 
 /** Everything ever wrapped to me, for a full rebuild after restore. */
 export async function fetchInbox(sk: Uint8Array, pk: string, relays: string[]): Promise<Inbound[]> {
   const wraps = await getPool().querySync(relays, { kinds: [1059], '#p': [pk] }, { maxWait: 6000 });
   return wraps.map((w) => openWrap(w, sk)).filter((m): m is Inbound => !!m);
+}
+
+/* -------------------------------------------------------------- compact invitations */
+
+export function publishInvite(relays: string[], carrier: NostrEvent): Promise<number> {
+  return publishAll(relays, carrier);
+}
+
+export function fetchInviteCarriers(relays: string[], carrierPk: string): Promise<NostrEvent[]> {
+  return getPool().querySync(relays, { kinds: [KIND_INVITE], authors: [carrierPk], limit: 10 }, { maxWait: 6000 });
 }
 
 export function closePool(relays: string[]): void {

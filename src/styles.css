@@ -850,3 +850,76 @@ button:focus-visible {
   border-color: var(--ink);
   color: var(--ink);
 }
+
+/* invitation card preview */
+.invite-card-img {
+  display: block;
+  width: 100%;
+  max-width: 340px;
+  height: auto;
+  margin: 0 auto 8px;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+}
+.ok-text {
+  color: var(--owed);
+}
+
+/* QR animation (envelope handed over in person) */
+.qr-anim-wrap {
+  display: grid;
+  justify-items: center;
+  gap: 10px;
+}
+.qr-anim {
+  width: min(78vw, 320px);
+  aspect-ratio: 1;
+  background: #fff;
+  border-radius: 12px;
+  padding: 4px;
+}
+.qr-anim svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+.qr-dots {
+  display: flex;
+  gap: 5px;
+  flex-wrap: wrap;
+  justify-content: center;
+}
+.qr-dots span {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--line);
+}
+.qr-dots span.on {
+  background: var(--ink);
+}
+
+/* camera scanner */
+.scanner {
+  display: grid;
+  gap: 10px;
+}
+.scanner-view {
+  position: relative;
+  aspect-ratio: 1;
+  border-radius: var(--radius);
+  overflow: hidden;
+  background: #000;
+}
+.scanner-view video {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+.scanner-frame {
+  position: absolute;
+  inset: 12%;
+  border: 3px solid var(--saffron);
+  border-radius: 16px;
+  box-shadow: 0 0 0 999px rgb(0 0 0 / 35%);
+}

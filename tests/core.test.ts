@@ -14,7 +14,16 @@ import {
   parseInvitation,
   tokenHash,
   KIND_GIFT,
+  newInviteSeed,
+  inviteCode,
+  parseInviteCode,
+  inviteKeys,
+  createInviteCarrier,
+  openInviteCarriers,
+  compactInvitationLink,
+  KIND_INVITE,
 } from '../src/core/protocol';
+import * as nip44 from 'nostr-tools/nip44';
 import { identityFromMnemonic, newMnemonic, isValidMnemonic } from '../src/core/keys';
 import { createVault, openVault, rekeyVault, dataKey, sealJson, openJson } from '../src/core/vault';
 
@@ -113,8 +122,12 @@ describe('protocol', () => {
     expect(receiptMatches(other, r)).toBe(false);
     const byFatou = createReceipt(fatou.sk, g, 'redeemed');
     expect(receiptMatches(g, byFatou)).toBe(false);
-    const cashStatus = createReceipt(awa.sk, g, 'received');
-    expect(receiptMatches(g, cashStatus)).toBe(false);
+    // an envelope handed over in person is receipted 'received' before it is cashed
+    expect(receiptMatches(g, createReceipt(awa.sk, g, 'received'))).toBe(true);
+    // a cash gift can never be receipted as 'redeemed'
+    const cash = createGift(fatou.sk, { ceremony: c, giverName: 'Fatou', xof: 10000, method: 'cash' });
+    expect(receiptMatches(cash, createReceipt(awa.sk, cash, 'redeemed'))).toBe(false);
+    expect(receiptMatches(cash, createReceipt(awa.sk, cash, 'received'))).toBe(true);
   });
 
   it('refuses tampered or malformed gifts', () => {
@@ -192,5 +205,56 @@ describe('ledger', () => {
 
   it('groups paper lines by normalized name', () => {
     expect(nameKey('  Ndèye   FALL ')).toBe('name:ndeye fall');
+  });
+});
+
+describe('compact invitation', () => {
+  const c = ceremony();
+  const seed = newInviteSeed();
+  const code = inviteCode(seed, awa.pk);
+
+  it('fits a small QR', () => {
+    expect(code).toMatch(/^[A-Za-z0-9_-]{32}$/);
+    const link = compactInvitationLink('https://ashank-crazy.github.io/kayit/#/home', code);
+    expect(link).toBe(`https://ashank-crazy.github.io/kayit/#/i/${code}`);
+    expect(link.length).toBeLessThan(80);
+    expect(parseInviteCode(code)?.hostPrefix).toBe(awa.pk.slice(0, 16));
+    expect(parseInviteCode('not a code!')).toBeNull();
+  });
+
+  it('opens the carrier the host published, and only with the right code', () => {
+    const carrier = createInviteCarrier(c, seed);
+    expect(carrier.kind).toBe(KIND_INVITE);
+    expect(carrier.pubkey).toBe(inviteKeys(seed).pk);
+    expect(carrier.pubkey).not.toBe(awa.pk); // relays never learn who hosts
+    expect(carrier.content).not.toContain('Aïda');
+    expect(openInviteCarriers([carrier], code)?.ref).toBe(c.ref);
+    expect(openInviteCarriers([carrier], inviteCode(newInviteSeed(), awa.pk))).toBeNull();
+  });
+
+  it('ignores a newer fake ceremony posted by someone who has the link', () => {
+    const genuine = createInviteCarrier(c, seed);
+    const fake = createCeremony(fatou.sk, {
+      hostName: 'Awa Diop',
+      title: 'Ngénte de bébé Aïda',
+      type: 'ngente',
+      start: 1795000000,
+      lockPk: fatou.lockPk, // envelopes would be locked to the attacker
+      mint: 'https://testnut.cashu.space',
+      relays: ['wss://relay.example'],
+    });
+    const k = inviteKeys(seed);
+    const hijack = finalizeEvent(
+      { kind: KIND_INVITE, created_at: genuine.created_at + 60, tags: [], content: nip44.encrypt(JSON.stringify(fake.event), k.key) },
+      k.sk,
+    );
+    expect(openInviteCarriers([hijack], code)).toBeNull();
+    expect(openInviteCarriers([hijack, genuine], code)?.lockPk).toBe(awa.lockPk);
+  });
+
+  it('rejects tampered carriers', () => {
+    const carrier = createInviteCarrier(c, seed);
+    expect(openInviteCarriers([{ ...carrier, content: carrier.content.slice(0, -4) + 'AAAA' }], code)).toBeNull();
+    expect(openInviteCarriers([{ ...carrier, created_at: carrier.created_at + 1 }], code)).toBeNull();
   });
 });

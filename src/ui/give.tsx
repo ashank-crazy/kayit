@@ -9,13 +9,33 @@ import { shortKey } from '../core/keys';
 import { t, fmtDate } from '../app/i18n';
 import { Btn, Card, Field, Money, Notice, Screen, errMsg, go, useEngine } from './kit';
 
-/** Opened from a WhatsApp / QR link: validate the signed ceremony, keep it, then show the give screen. */
+/** Opened from a long WhatsApp / QR link: validate the signed ceremony, keep it, then show the give screen. */
 export function InviteLanding(props: { engine: Engine; payload: string }) {
   const c = parseInvitation(props.payload);
   useEffect(() => {
     if (c && c.hostPk !== props.engine.id.pk) props.engine.addInvitation(c).catch(() => undefined);
   }, [props.payload]);
   if (!c) return <Screen title="Kayit" back="" children={<Notice kind="error">{t('invalid_invite')}</Notice>} />;
+  return <CeremonyLanding engine={props.engine} c={c} />;
+}
+
+/** Opened from a short link (#/i/<code>): fetch the encrypted ceremony from relays, check it, show it. */
+export function InviteCodeLanding(props: { engine: Engine; code: string }) {
+  const [c, setC] = useState<Ceremony | null | undefined>(undefined);
+  useEffect(() => {
+    setC(undefined);
+    props.engine
+      .openInviteCode(props.code)
+      .then(setC)
+      .catch(() => setC(null));
+  }, [props.code]);
+  if (c === undefined) return <Screen title="Kayit" back="" children={<p class="muted center">{t('opening_invite')}</p>} />;
+  if (c === null) return <Screen title="Kayit" back="" children={<Notice kind="error">{t('invite_not_found')}</Notice>} />;
+  return <CeremonyLanding engine={props.engine} c={c} />;
+}
+
+function CeremonyLanding(props: { engine: Engine; c: Ceremony }) {
+  const c = props.c;
   if (c.hostPk === props.engine.id.pk) {
     return (
       <Screen title={c.title} back="">
@@ -41,7 +61,7 @@ function Give(props: { engine: Engine; ceremony: Ceremony }) {
   const [amount, setAmount] = useState(String(s.suggested));
   const [message, setMessage] = useState('');
   const [err, setErr] = useState<string | null>(null);
-  const [busy, setBusy] = useState<'ecash' | 'cash' | null>(null);
+  const [busy, setBusy] = useState<'ecash' | 'cash' | 'hand' | null>(null);
   const [done, setDone] = useState<'ecash' | 'cash' | null>(null);
 
   const xof = parseXof(amount);
@@ -66,12 +86,16 @@ function Give(props: { engine: Engine; ceremony: Ceremony }) {
     );
   }
 
-  const send = async (method: 'ecash' | 'cash') => {
+  const send = async (method: 'ecash' | 'cash' | 'hand') => {
     setErr(null);
     if (!xof) return setErr(t('amount'));
     if (overCap) return setErr(t('over_cap', { amount: formatXof(c.capXof!) }));
     setBusy(method);
     try {
+      if (method === 'hand') {
+        const g = await e.prepareEnvelope(c, xof, message);
+        return go(`envelope/${g.id}`);
+      }
       if (method === 'ecash') await e.giveEcash(c, xof, message);
       else await e.giveCash(c, xof, message);
       setDone(method);
@@ -147,6 +171,10 @@ function Give(props: { engine: Engine; ceremony: Ceremony }) {
             </button>
           </Notice>
         )}
+        <Btn kind="ghost" busy={busy === 'hand'} disabled={!xof || overCap || !sameMint || busy !== null} onClick={() => send('hand')}>
+          {t('give_hand')}
+        </Btn>
+        <p class="muted small">{t('give_hand_hint', { host: c.hostName })}</p>
         <Btn kind="ghost" busy={busy === 'cash'} disabled={!xof || overCap || busy !== null} onClick={() => send('cash')}>
           {t('give_cash')}
         </Btn>

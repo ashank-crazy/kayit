@@ -71,8 +71,10 @@ export function Home(props: { engine: Engine; onLock: () => void; demo?: { pin: 
         {invites.map((c) => {
           const s = suggest(st.entries, c.hostPk, st.settings.multiplier, c.capXof);
           const given = st.entries.some((x) => x.ceremonyRef === c.ref && x.direction === 'out' && x.status !== 'rejected');
+          // an envelope prepared at home opens straight to its QR, ready to hand over at the door
+          const prep = st.outbox.find((o) => o.state === 'prepared' && st.entries.some((x) => x.id === o.giftId && x.ceremonyRef === c.ref));
           return (
-            <Card onClick={() => go(`give/${encodeURIComponent(c.ref)}`)}>
+            <Card onClick={() => go(prep ? `envelope/${prep.giftId}` : `give/${encodeURIComponent(c.ref)}`)}>
               <div class="row">
                 <div class="date-chip">
                   <strong>{fmtDate(c.start, { day: 'numeric' })}</strong>
@@ -83,7 +85,9 @@ export function Home(props: { engine: Engine; onLock: () => void; demo?: { pin: 
                   <div class="muted small">{c.hostName}</div>
                 </div>
                 <div class="right">
-                  {given ? (
+                  {prep ? (
+                    <span class="badge badge-awaiting-receipt">✉ {t('e_prepared')}</span>
+                  ) : given ? (
                     <span class="badge badge-cosigned">✓</span>
                   ) : (
                     <>
@@ -125,15 +129,15 @@ export function Home(props: { engine: Engine; onLock: () => void; demo?: { pin: 
         class="open-link"
         onSubmit={(ev) => {
           ev.preventDefault();
-          const m = link.match(/#\/invite\/([A-Za-z0-9_-]+)/);
-          if (m) go(`invite/${m[1]}`);
+          const m = link.match(/#\/(invite|i)\/([A-Za-z0-9_-]+)/);
+          if (m) go(`${m[1]}/${m[2]}`);
         }}
       >
         <label class="field">
           <span class="field-label">{t('open_link')}</span>
           <div class="row">
             <input class="grow" placeholder={t('paste_link')} value={link} onInput={(ev) => setLink(ev.currentTarget.value)} />
-            <Btn kind="ghost" type="submit" disabled={!/#\/invite\//.test(link)}>
+            <Btn kind="ghost" type="submit" disabled={!/#\/(invite|i)\//.test(link)}>
               {t('open')}
             </Btn>
           </div>

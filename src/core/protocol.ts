@@ -10,9 +10,10 @@
  * A notebook line is "co-signed" when the gift and its receipt are both present and valid. Neither side can
  * later inflate, deny or invent a line, and the whole notebook can be rebuilt from relays with the 12 words.
  */
-import { finalizeEvent, verifyEvent, type NostrEvent } from 'nostr-tools/pure';
+import { finalizeEvent, getPublicKey, verifyEvent, type NostrEvent } from 'nostr-tools/pure';
+import * as nip44 from 'nostr-tools/nip44';
 import { sha256 } from '@noble/hashes/sha2.js';
-import { bytesToHex } from '@noble/hashes/utils.js';
+import { bytesToHex, hexToBytes } from '@noble/hashes/utils.js';
 
 export const KIND_CEREMONY = 31923;
 export const KIND_GIFT = 9330;
@@ -235,6 +236,104 @@ export function parseInvitation(payload: string): Ceremony | null {
   }
 }
 
+/* ------------------------------------------------------------------ compact invitation */
+
+/**
+ * A short invitation that fits a small QR: `#/i/<code>`, where the code is 24 bytes in base64url:
+ *   16-byte random seed  ||  first 8 bytes of the host's public key.
+ * From the seed both sides derive a throwaway signing key and an encryption key. The host publishes the
+ * signed ceremony, NIP-44 encrypted, as a carrier event (kind 9333) from the throwaway key. Relays see a
+ * random key posting ciphertext. Anyone holding the link could post a second carrier, so the guest only
+ * accepts a ceremony whose host key starts with the 8-byte prefix in the code (forging that takes ~2^64 work).
+ */
+export const KIND_INVITE = 9333;
+const INVITE_SEED_BYTES = 16;
+const INVITE_PREFIX_BYTES = 8;
+
+export function bytesToB64Url(bytes: Uint8Array): string {
+  let bin = '';
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+export function b64UrlToBytes(s: string): Uint8Array {
+  if (!/^[A-Za-z0-9_-]*$/.test(s)) throw new Error('bad base64url');
+  const b = s.replace(/-/g, '+').replace(/_/g, '/');
+  const bin = atob(b + '='.repeat((4 - (b.length % 4)) % 4));
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+function derive(label: string, seed: Uint8Array): Uint8Array {
+  const l = new TextEncoder().encode(label);
+  const buf = new Uint8Array(l.length + seed.length);
+  buf.set(l);
+  buf.set(seed, l.length);
+  return sha256(buf);
+}
+
+export interface InviteKeys {
+  seed: Uint8Array;
+  sk: Uint8Array;
+  pk: string;
+  key: Uint8Array;
+}
+
+export function inviteKeys(seed: Uint8Array): InviteKeys {
+  if (seed.length !== INVITE_SEED_BYTES) throw new Error('bad invite seed');
+  const sk = derive('kayit:invite:sk', seed);
+  return { seed, sk, pk: getPublicKey(sk), key: derive('kayit:invite:key', seed) };
+}
+
+export function newInviteSeed(): Uint8Array {
+  return globalThis.crypto.getRandomValues(new Uint8Array(INVITE_SEED_BYTES));
+}
+
+export function inviteCode(seed: Uint8Array, hostPk: string): string {
+  const code = new Uint8Array(INVITE_SEED_BYTES + INVITE_PREFIX_BYTES);
+  code.set(seed);
+  code.set(hexToBytes(hostPk).slice(0, INVITE_PREFIX_BYTES), INVITE_SEED_BYTES);
+  return bytesToB64Url(code);
+}
+
+export function parseInviteCode(code: string): { seed: Uint8Array; hostPrefix: string } | null {
+  try {
+    const b = b64UrlToBytes(code);
+    if (b.length !== INVITE_SEED_BYTES + INVITE_PREFIX_BYTES) return null;
+    return { seed: b.slice(0, INVITE_SEED_BYTES), hostPrefix: bytesToHex(b.slice(INVITE_SEED_BYTES)) };
+  } catch {
+    return null;
+  }
+}
+
+export function compactInvitationLink(baseUrl: string, code: string): string {
+  return `${baseUrl.split('#')[0]}#/i/${code}`;
+}
+
+export function createInviteCarrier(c: Ceremony, seed: Uint8Array): NostrEvent {
+  const k = inviteKeys(seed);
+  return finalizeEvent({ kind: KIND_INVITE, created_at: now(), tags: [], content: nip44.encrypt(JSON.stringify(c.event), k.key) }, k.sk);
+}
+
+/** The newest carrier that decrypts to a valid ceremony from the host named in the code. */
+export function openInviteCarriers(events: NostrEvent[], code: string): Ceremony | null {
+  const parsed = parseInviteCode(code);
+  if (!parsed) return null;
+  const k = inviteKeys(parsed.seed);
+  const sorted = [...events].sort((a, b) => b.created_at - a.created_at);
+  for (const ev of sorted) {
+    if (ev.kind !== KIND_INVITE || ev.pubkey !== k.pk || ev.content.length > 16_000 || !strictVerify(ev)) continue;
+    try {
+      const c = parseCeremony(JSON.parse(nip44.decrypt(ev.content, k.key)) as NostrEvent);
+      if (c && c.hostPk.startsWith(parsed.hostPrefix)) return c;
+    } catch {
+      /* not ours, or tampered: try the next one */
+    }
+  }
+  return null;
+}
+
 /* ------------------------------------------------------------------ gift */
 
 export function createGift(
@@ -335,7 +434,8 @@ export function receiptMatches(gift: Gift, receipt: Receipt): boolean {
     receipt.hostPk === gift.hostPk &&
     receipt.giverPk === gift.giverPk &&
     receipt.xof === gift.xof &&
-    (gift.method === 'ecash' ? receipt.status === 'redeemed' : receipt.status === 'received')
+    // cash is only ever 'received'; ecash is 'redeemed' once cashed, or 'received' when checked offline (handed over)
+    (receipt.status === 'received' || (gift.method === 'ecash' && receipt.status === 'redeemed'))
   );
 }
 

@@ -1,7 +1,7 @@
 # Kayit threat model
 
 Scope: the Kayit PWA, the bundled server (`server/serve.mjs` + `server/relay.mjs`), the Cashu mint it talks to and
-the Nostr relays it uses. Version 0.1, test mint only.
+the Nostr relays it uses. Version 0.2, test mint only.
 
 ## What we protect
 
@@ -21,6 +21,8 @@ the Nostr relays it uses. Version 0.1, test mint only.
 4. **A malicious or compromised web server** hosting the app.
 5. **A dishonest mint** (custodial risk).
 6. **A malformed or hostile event** crafted to crash or confuse the app.
+7. **Someone at the ceremony with a phone**: a guest showing a fake or recycled envelope QR, or someone filming
+   another guest's envelope.
 
 Out of scope for v0.1: a fully compromised phone OS or browser, a malicious browser extension, coercion of the user.
 
@@ -51,12 +53,30 @@ Out of scope for v0.1: a fully compromised phone OS or browser, a malicious brow
 |---|---|
 | Stealing an envelope in transit | The token is **P2PK‑locked (NUT‑11)** to the host's lock key; only that key can redeem it. The giver's key is the only refund key, after `ceremony start + 30 days`. |
 | Relay reads gift contents or the social graph | Gifts, tokens and receipts travel as **NIP‑59 gift wraps**: the relay sees a random throwaway sender key, the recipient key and ciphertext. Backups are NIP‑44 encrypted to self. |
-| Relay or server learns the ceremony | The signed ceremony travels in the **URL fragment** (`#/invite/…`), which browsers never send to servers. |
+| Relay or server learns the ceremony | The long link carries the signed ceremony in the **URL fragment** (`#/invite/…`), which browsers never send to servers. The short link (`#/i/<code>`) keeps a 16‑byte secret in the fragment; the ceremony sits on relays **NIP‑44 encrypted** with a key derived from that secret, signed by a throwaway key also derived from it (kind 9333). The relay sees a random pubkey and ciphertext. |
+| Hijacking a short code (anyone holding the code can derive the carrier key and publish a fake carrier) | The code also holds the first 8 bytes of the host's key. The guest's phone accepts a carrier only if the decrypted ceremony is **signed by the host** and that host key starts with those bytes: forging one needs a 2⁶⁴ key search. The newest valid carrier wins; invalid or newer fake ones are skipped (tested). |
 | Relay drops or delays messages | Messages go to several relays; sending succeeds on the first that accepts. A self‑copy of each envelope restores it on the giver's new phone, so it can still be reclaimed. Unopened envelopes can be reclaimed after the locktime. |
 | Replay of an old gift | Gifts are keyed by event id; a second copy is ignored. A token already redeemed is detected (`already-opened`). |
+| Backup too big for one event, or a save cut off half‑way | The notebook is compressed and split into ≤ 30 KB parts, each NIP‑44 encrypted to self, plus a manifest naming the set by hash. Parts alternate between two slots: a save writes the slot the live manifest does not use and switches the manifest last, so an interrupted save never damages the existing backup (live‑tested). |
 | Forged ceremony with the attacker's lock key | The ceremony is signed by the host; the invitation screen shows the host's name and a short key fingerprint. Envelopes are locked to the key **inside the signed ceremony**. Residual risk: a convincing fake host name on a link from an unknown sender — users should open links from people they know. |
 
-### 4. Malicious web server
+### 4. Hand‑over with no network
+
+At the ceremony the host's phone may have no network, so it cannot ask the mint whether an envelope is good.
+Everything it needs is checked locally before it signs a receipt:
+
+| Threat | Mitigation |
+|---|---|
+| Fake envelope (made‑up proofs) | Every proof's **DLEQ proof (NUT‑12)** is checked against the mint keys the phone **cached while online** (refreshed at every start). Unknown keyset or no cached keys → refused (`no-mint-keys`). |
+| Envelope for someone else, or a photo of another guest's envelope | Every proof must be **P2PK‑locked to this host's lock key alone** (`requiredSigners` = 1). The gift must name this host and one of her ceremonies. A filmed QR is useless to anyone but the host. A stranger's phone refuses it (`not-for-me`, live‑tested). |
+| Token swapped after the gift was signed | `sha256(token)` must equal the hash inside the giver's signed gift (`token-mismatch`, live‑tested). |
+| Short envelope | The token must cover the signed amount (`short`). |
+| Giver takes the envelope back right after the hand‑over | Only possible after the lock time. The host's phone refuses envelopes with less than **2 days** of lock left (`lock-expiring`), and cashes the envelope at the next connection. |
+| Same envelope shown twice | The second scan returns the existing receipt; the line is keyed by gift id. |
+| Hostile QR frames | At most 40 frames of 300 bytes; the payload is checked against the hash in the frame header; decompression stops at 64 KB (a 4 MB "zip bomb" is refused, tested); then every event is signature‑checked like any other. |
+| **Residual risk** | Until the host reconnects, the receipt says `received`, not `redeemed`: the maths is checked, the mint has not been asked. If the mint refuses or disappears in between, the host loses that envelope, as with any custodial mint. When she cashes it, her phone sends a `redeemed` receipt and the giver's line moves to "opened". |
+
+### 5. Malicious web server
 
 | Threat | Mitigation |
 |---|---|
@@ -64,7 +84,7 @@ Out of scope for v0.1: a fully compromised phone OS or browser, a malicious brow
 | Pointing the app at an attacker's mint | Mint and relays come from `/kayit-config.json`; a different mint is shown in the caisse and in technical settings, and a ceremony on another mint is refused when giving (`other-mint`). |
 | Tracking | No analytics, no cookies, no fonts or images from other origins, `Referrer-Policy: no-referrer`. |
 
-### 5. Dishonest mint
+### 6. Dishonest mint
 
 Cashu mints are custodial: a mint can refuse to redeem or disappear. Mitigations in v0.1: amounts per ceremony are
 small, the host's redemption happens immediately on arrival (sats are not left in transit), the caisse lets users
@@ -72,14 +92,14 @@ withdraw to their own Lightning wallet at any time, and envelopes are checked wi
 knows the signatures are valid before redeeming. Next: let a community choose a mint it trusts, or a
 federation, and show the mint's identity at top‑up.
 
-### 6. Hostile input
+### 7. Hostile input
 
 | Threat | Mitigation |
 |---|---|
 | Huge or malformed events | Relay limit 128 KB per message, 20 subscriptions per connection, 120 events per minute per connection; signature verified before storing. |
 | Bad amounts | Integers only, `0 < xof ≤ 50 000 000`, checked in `assertAmount` / `parseXof` and again when parsing every event. |
 | Text injection | Names, titles and messages capped (≤ 280 chars) and stripped of control characters; rendered as text by Preact (no `innerHTML` except the locally generated QR SVG). |
-| Path traversal on the server | Paths are normalised and must stay under `dist/`. |
+| Path traversal on the server | Paths are URL‑decoded (malformed → 400), normalised, and must stay inside `dist/` itself: the check is `root + path.sep`, so a sibling folder such as `dist-old/` is out of reach (403). |
 | Unexpected envelope payloads | Discriminated union parsed field by field; anything that does not verify is dropped silently. |
 
 ## Secrets handling
@@ -98,6 +118,8 @@ federation, and show the mint's identity at top‑up.
 ## Least privilege
 
 - The ecash **lock key** is a separate derivation (NIP‑06 account 1) from the Nostr identity (account 0).
-- The web app asks for no device permissions (camera, microphone and location are disabled by
-  `Permissions-Policy` on the bundled server).
+- The web app asks for one device permission, the **camera**, and only when the host or guest taps *Scan*. Frames
+  are decoded on the phone and never stored or sent. The bundled server sends
+  `Permissions-Policy: camera=(self), microphone=(), geolocation=()`, so no embedded or third‑party origin can
+  ask for it.
 - The Docker image runs as the unprivileged `node` user.

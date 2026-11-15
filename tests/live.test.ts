@@ -14,6 +14,15 @@ import { Engine, emptyState, type State } from '../src/core/engine';
 import { identityFromMnemonic, newMnemonic } from '../src/core/keys';
 import { balances, splits } from '../src/core/ledger';
 import { FALLBACK_RATE } from '../src/core/money';
+import { packMessage, unpackMessage, toFrames, FrameCollector, type AirMessage } from '../src/core/airgap';
+
+/** Send a message through the QR frame path, as the camera would read it. */
+async function overQr(m: AirMessage): Promise<AirMessage> {
+  const col = new FrameCollector();
+  let payload: Uint8Array | undefined;
+  for (const f of toFrames(await packMessage(m))) payload = col.add(f)?.payload ?? payload;
+  return unpackMessage(payload!);
+}
 
 const LIVE = process.env.KAYIT_LIVE === '1';
 const MINT = process.env.KAYIT_MINT || 'https://testnut.cashu.space';
@@ -109,13 +118,69 @@ describe.skipIf(!LIVE)('live: envelope from Fatou to Awa', () => {
       import('../src/core/wallet').then((W) => W.inspectEnvelope(env.token, MINT, stranger.e.id.lockPk)),
     ).resolves.toMatchObject({ ok: false });
 
+    // envelope handed over in person: prepared at home (online), checked and receipted with NO network
+    await awa.e.refreshMintKeys();
+    const hand = await fatou.e.prepareEnvelope(c, 5000, 'De la part de la famille Ndiaye');
+    expect(fatou.e.state.outbox.find((o) => o.giftId === hand.id)?.state).toBe('prepared');
+    const shown = await overQr(fatou.e.handoverMessage(hand.id));
+    const awaBefore = awa.e.balanceSats();
+    const realFetch = globalThis.fetch;
+    let blocked = 0;
+    globalThis.fetch = (async () => {
+      blocked++;
+      throw new TypeError('offline');
+    }) as typeof fetch;
+    let accepted: Awaited<ReturnType<typeof awa.e.acceptHanded>>;
+    try {
+      // a stranger's phone refuses the envelope
+      await expect(engine('Stranger').e.acceptHanded(shown)).rejects.toThrow('not-for-me');
+      // a token swapped after signing is refused
+      const other = fatou.e.state.outbox.find((o) => o.giftId === gift.id)!.token;
+      await expect(awa.e.acceptHanded({ ...shown, token: other } as AirMessage)).rejects.toThrow('token-mismatch');
+      accepted = await awa.e.acceptHanded(shown);
+      // Fatou scans the receipt from Awa's screen, still offline
+      await fatou.e.acceptScannedReceipt(await overQr({ kind: 'receipt', receipt: accepted.receipt, gift: accepted.gift.event }));
+      await new Promise((r) => setTimeout(r, 300)); // the background cash-in tries, and fails, offline
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+    expect(blocked).toBeGreaterThan(0); // the mint really was unreachable meanwhile
+    expect(accepted.already).toBe(false);
+    expect(awa.e.state.entries.find((e) => e.id === hand.id)?.status).toBe('cosigned');
+    expect(fatou.e.state.entries.find((e) => e.id === hand.id)?.status).toBe('cosigned');
+    expect(fatou.e.state.outbox.find((o) => o.giftId === hand.id)?.state).toBe('handed');
+    expect(awa.e.toRedeemSats()).toBeGreaterThanOrEqual(hand.sats!); // the token also carries the swap fee
+    expect(awa.e.balanceSats()).toBe(awaBefore);
+    // the network is back: Awa's phone cashes the envelope
+    await awa.e.flushHanded();
+    expect(awa.e.toRedeemSats()).toBe(0);
+    expect(awa.e.balanceSats()).toBeGreaterThanOrEqual(awaBefore + hand.sats!);
+    // …and tells Fatou over Nostr that it is cashed
+    await until(() => fatou.e.state.outbox.find((o) => o.giftId === hand.id)?.state === 'opened');
+    expect((await awa.e.acceptHanded(shown)).already).toBe(true);
+
     // Fatou loses her phone: restore from the 12 words on a new device
     await fatou.e.backupNow();
+    await fatou.e.backupNow(); // the second save goes to the other slot
+    // a third save cut off after its first part (tab closed) must not damage the backup already there
+    {
+      const { finalizeEvent } = await import('nostr-tools/pure');
+      const { SimplePool } = await import('nostr-tools/pool');
+      const nip44 = await import('nostr-tools/nip44');
+      const pool = new SimplePool();
+      const key = nip44.getConversationKey(fatou.e.id.sk, fatou.e.id.pk);
+      const [manifest] = await pool.querySync(RELAYS, { kinds: [30078], authors: [fatou.e.id.pk], '#d': ['kayit:backup:v2'] });
+      const live = JSON.parse(nip44.decrypt(manifest.content, key)) as { slot: 'a' | 'b' };
+      const other = live.slot === 'a' ? 'b' : 'a';
+      const cut = finalizeEvent({ kind: 30078, created_at: manifest.created_at + 1, tags: [['d', `kayit:backup:v2:${other}:0`]], content: nip44.encrypt(JSON.stringify({ id: 'unfinished', i: 0, p: 'AAAA' }), key) }, fatou.e.id.sk);
+      await Promise.any(pool.publish(RELAYS, cut));
+      pool.close(RELAYS);
+    }
     const phone2 = engine('?', fatou.mnemonic);
     const r = await phone2.e.restoreFromRelays();
     expect(r.fromBackup).toBe(true);
     const restored = phone2.e.state.entries.filter((e) => e.status === 'cosigned').map((e) => e.id).sort();
-    expect(restored).toEqual([gift.id, cash.id].sort());
+    expect(restored).toEqual([gift.id, cash.id, hand.id].sort());
     expect(phone2.e.balanceSats()).toBe(fatou.e.balanceSats());
   });
 });
