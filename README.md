@@ -7,6 +7,8 @@ the envelope is handed over in a courtyard with no network.
 
 > Dakar Bitcoin Hack 2026 entry · MIT licence · test mint only (no real sats)
 
+**▶ Demo video (2:35):** <https://youtu.be/6YKSals4J0w> · **Try it:** <https://ashank-crazy.github.io/kayit/>
+
 <p>
 <img src="docs/screens/02-home.jpg" width="160" alt="Home: what I owe, what I'm owed, upcoming ceremonies">
 <img src="docs/screens/03-give.jpg" width="160" alt="Give: the suggested return, split into repayment and new advance">
